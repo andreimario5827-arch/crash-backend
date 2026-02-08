@@ -159,26 +159,66 @@ bot.command('buy', (ctx) => {
     });
 });
 
+// --- CONFIRMARE PLATA (Pre-Checkout) ---
+// Aceasta linie este OBLIGATORIE ca plata sa nu fie anulata de Telegram
 bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
 
+// --- PROCESARE PLATA (Dupa ce au dat banii) ---
 bot.on('successful_payment', async(ctx) => {
+    // 1. LOG DEBUT - Vedem ce primim de la Telegram
+    console.log("💰 PLATA PRIMITA! Detalii:", ctx.message.successful_payment);
+
     const userId = ctx.from.id;
-    const username = ctx.from.username || 'Anon';
+    const username = ctx.from.username || 'Anonim';
     const amountPaid = ctx.message.successful_payment.total_amount;
+    const currency = ctx.message.successful_payment.currency;
 
-    // 50 Stars = 1000 Chips
-    const chipsToAdd = (amountPaid === 50) ? 1000 : 100;
+    console.log(`👤 Procesam pentru User ID: ${userId} (${username}) | Suma: ${amountPaid} ${currency}`);
 
-    const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
-    const currentBalance = user ? user.balance : 0;
+    // 2. LOGICA SIMPLIFICATA - Daca a platit, ii dam cipurile!
+    // Nu mai verificam strict daca e 50 sau 5000, ca sa evitam erori de unitati.
+    const chipsToAdd = 1000;
 
-    await supabase.from('users').upsert({
-        id: userId,
-        username: username,
-        balance: currentBalance + chipsToAdd
-    });
+    try {
+        // 3. CITIM BALANTA ACTUALA
+        const { data: user, error: fetchError } = await supabase
+            .from('users')
+            .select('balance')
+            .eq('id', userId)
+            .single();
 
-    ctx.reply(`PLATA REUSITA! 🌟\nAm adaugat ${chipsToAdd} Cipuri in contul tau.`);
+        if (fetchError && fetchError.code !== 'PGRST116') { // Ignoram eroarea "User not found" (e normal la primul joc)
+            console.error("❌ Eroare la citirea din baza de date:", fetchError);
+            return ctx.reply("Am primit plata, dar avem o eroare la baza de date. Contacteaza adminul!");
+        }
+
+        const currentBalance = user ? user.balance : 0;
+        const newBalance = currentBalance + chipsToAdd;
+
+        console.log(`🔄 Actualizam balanta: ${currentBalance} -> ${newBalance}`);
+
+        // 4. SALVAM NOUA BALANTA
+        const { error: upsertError } = await supabase
+            .from('users')
+            .upsert({
+                id: userId,
+                username: username,
+                balance: newBalance
+            });
+
+        if (upsertError) {
+            console.error("❌ Eroare la scrierea in baza de date:", upsertError);
+            return ctx.reply("Eroare critica la salvare. Trimite un screenshot adminului.");
+        }
+
+        console.log("✅ SUCCES! Cipurile au fost adaugate.");
+
+        // 5. CONFIRMARE CATRE UTILIZATOR
+        await ctx.reply(`✅ PLATA REUSITA! 🌟\n\nAi primit ${chipsToAdd} Cipuri.\nBalanța ta nouă: ${newBalance} 🪙`);
+
+    } catch (err) {
+        console.error("❌ EROARE NEASTEPTATA:", err);
+    }
 });
 // --- COMANDA DE START JOC ---
 bot.command('play', (ctx) => {
