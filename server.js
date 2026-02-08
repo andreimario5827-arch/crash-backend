@@ -180,6 +180,18 @@ bot.on('successful_payment', async(ctx) => {
 
     ctx.reply(`PLATA REUSITA! 🌟\nAm adaugat ${chipsToAdd} Cipuri in contul tau.`);
 });
-
+// --- COMANDA DE START JOC ---
+bot.command('play', (ctx) => {
+    return ctx.reply('Ești gata de lansare? 🚀\n\nJoacă acum și câștigă cipuri!', {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    // Folosim "url" pentru link-ul t.me
+                    { text: "🎮 PLAY NOW", url: "https://t.me/MoversCrash_bot/play" }
+                ]
+            ]
+        }
+    });
+});
 bot.launch();
 server.listen(3000, () => console.log('Server running on 3000'));
