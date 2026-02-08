@@ -1,4 +1,3 @@
-// server.js
 require('dotenv').config();
 const express = require('express');
 const http = require('http');
@@ -7,7 +6,6 @@ const { Telegraf } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 
-// 1. Setup
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
@@ -16,123 +14,133 @@ const io = new Server(server, { cors: { origin: "*" } });
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 2. Game State
+// Game State
 let gameState = {
-    status: 'IDLE', // IDLE, RUNNING, CRASHED
+    status: 'BETTING', // New starting state
     multiplier: 1.00,
-    crashPoint: 0
+    crashPoint: 0,
+    countdown: 5 // 5 seconds to bet
 };
 
-// 3. The Game Loop (The Engine)
+// The Game Loop
 const startGame = () => {
-    if (gameState.status === 'RUNNING') return;
-
-    // Calculate Crash Point (Weighted random to crash early often, rare high spikes)
-    // Simple algorithm: 0.99 / (1 - Math.random())
-    gameState.crashPoint = Math.max(1.00, (0.99 / (1 - Math.random())));
+    // 1. BETTING PHASE (5 Seconds)
+    gameState.status = 'BETTING';
     gameState.multiplier = 1.00;
+    gameState.countdown = 5;
+
+    let countdownInterval = setInterval(() => {
+        gameState.countdown--;
+        io.emit('game_state_update', gameState);
+
+        if (gameState.countdown <= 0) {
+            clearInterval(countdownInterval);
+            runGame(); // Start the rocket
+        }
+    }, 1000);
+};
+
+const runGame = () => {
+    // 2. RUNNING PHASE (Rocket Flies)
     gameState.status = 'RUNNING';
+    // Crash algorithm: skewed random to crash early often, but sometimes fly high
+    gameState.crashPoint = Math.max(1.00, (0.99 / (1 - Math.random())));
 
-    console.log(`🚀 New Round! Will crash at ${gameState.crashPoint.toFixed(2)}x`);
-    io.emit('game_start', { startTime: Date.now() });
+    console.log(`🚀 Launching! Target: ${gameState.crashPoint.toFixed(2)}x`);
+    io.emit('game_state_update', gameState);
 
-    // The "Tick" Loop
-    let interval = setInterval(() => {
-        // Exponential growth formula: e^(0.06 * time)
-        gameState.multiplier += gameState.multiplier * 0.08;
+    let flyInterval = setInterval(() => {
+        gameState.multiplier += gameState.multiplier * 0.08; // Speed of rocket
 
         if (gameState.multiplier >= gameState.crashPoint) {
-            clearInterval(interval);
+            clearInterval(flyInterval);
             crashGame();
         } else {
             io.emit('tick', gameState.multiplier);
         }
-    }, 100); // Update every 100ms
+    }, 100);
 };
 
 const crashGame = () => {
+    // 3. CRASH PHASE (Explosion)
     gameState.status = 'CRASHED';
     io.emit('crash', gameState.multiplier);
     console.log(`💥 Crashed at ${gameState.multiplier.toFixed(2)}x`);
 
-    // Wait 5 seconds then restart
+    // Wait 3 seconds then go back to betting
     setTimeout(() => {
-        gameState.status = 'IDLE';
-        io.emit('game_idle');
-        setTimeout(startGame, 3000); // 3s countdown
-    }, 5000);
+        startGame();
+    }, 3000);
 };
 
-// Start the first loop
+// Start the loop
 startGame();
 
-// 4. Socket.io (Realtime Betting)
+// --- SOCKET.IO (Realtime Game) ---
 io.on('connection', (socket) => {
-    socket.emit('init', gameState); // Send current state to new user
+    socket.emit('game_state_update', gameState); // Send current state to new user
 
-    // Handle "Place Bet"
     socket.on('place_bet', async({ userId, amount }) => {
-        if (gameState.status !== 'IDLE') return; // Can only bet in IDLE
+        if (gameState.status !== 'BETTING') return; // Can only bet during countdown
 
-        // Check balance
         const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
-        if (!user || user.balance < amount) return socket.emit('error', 'Insufficient funds');
+        if (!user || user.balance < amount) return;
 
-        // Deduct Balance
+        // Deduct Balance immediately
         await supabase.from('users').update({ balance: user.balance - amount }).eq('id', userId);
         socket.emit('bet_accepted', { amount });
     });
 
-    // Handle "Cash Out"
     socket.on('cash_out', async({ userId, amount, multiplier }) => {
         if (gameState.status !== 'RUNNING') return;
-
         const profit = Math.floor(amount * multiplier);
 
-        // Update DB
-        await supabase.rpc('increment_balance', { user_id: userId, amount: profit });
-
-        // Log the win
-        await supabase.from('bets').insert({ user_id: userId, amount, cash_out_at: multiplier, profit });
+        // Add Winnings (RPC function recommended, but direct update for MVP is fine)
+        const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
+        await supabase.from('users').update({ balance: user.balance + profit }).eq('id', userId);
 
         socket.emit('cash_out_success', { profit });
     });
 });
 
-// 5. Telegram Bot (Payments)
-bot.command('start', (ctx) => ctx.reply('Welcome! Type /buy to get chips.'));
-
-// Invoice for 50 Stars
-bot.command('buy', (ctx) => {
+// --- TELEGRAM PAYMENTS (Stars) ---
+// 1. Trigger Invoice
+bot.command('buy', (ctx) => sendInvoice(ctx));
+// Also allow triggering via web app data if needed, but command is easiest for testing
+function sendInvoice(ctx) {
     return ctx.replyWithInvoice({
-        title: '1,000 Game Chips',
-        description: 'Fuel for the rocket 🚀',
-        payload: 'pack_1000',
+        title: '1,000 Moon Chips',
+        description: 'Fuel for your rocket 🚀',
+        payload: 'packet_1000',
         provider_token: "", // EMPTY for Telegram Stars
-        currency: 'XTR',
-        prices: [{ label: '1,000 Chips', amount: 50 }], // 50 Stars
+        currency: 'XTR', // The code for Stars
+        prices: [{ label: '1,000 Chips', amount: 50 }], // 50 Stars ($1.00 approx)
     });
-});
+}
 
+// 2. Pre-Checkout (Must approve instantly)
 bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
 
+// 3. Successful Payment (Give Chips)
 bot.on('successful_payment', async(ctx) => {
     const userId = ctx.from.id;
-    const username = ctx.from.username;
+    const username = ctx.from.username || 'Anon';
+    const amountPaid = ctx.message.successful_payment.total_amount; // 50 Stars
 
-    // Upsert user (create if new) and add 1000 chips
+    // Logic: 50 Stars = 1000 Chips
+    const chipsToAdd = (amountPaid === 50) ? 1000 : 100;
+
     const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
     const currentBalance = user ? user.balance : 0;
 
     await supabase.from('users').upsert({
         id: userId,
         username: username,
-        balance: currentBalance + 1000
+        balance: currentBalance + chipsToAdd
     });
 
-    ctx.reply('Payment successful! 1,000 Chips added. 🎰');
+    ctx.reply(`PAYMENT RECEIVED! 🌟\nAdded ${chipsToAdd} Chips to your balance.`);
 });
 
-// Start Server
 bot.launch();
-server.listen(3000, () => console.log('Server running on port 3000'));
+server.listen(3000, () => console.log('Server running on 3000'));
