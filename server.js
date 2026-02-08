@@ -6,6 +6,11 @@ const { Telegraf } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 
+// --- CONFIGURARE ADMIN ---
+// ⚠️ INLOCUIESTE '00000000' CU ID-UL TAU DE TELEGRAM (de la @userinfobot)
+const ADMIN_ID = 5418546828;
+// -------------------------
+
 const app = express();
 app.use(cors());
 const server = http.createServer(app);
@@ -16,15 +21,14 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 
 // Game State
 let gameState = {
-    status: 'BETTING', // New starting state
+    status: 'BETTING',
     multiplier: 1.00,
     crashPoint: 0,
-    countdown: 5 // 5 seconds to bet
+    countdown: 5
 };
 
 // The Game Loop
 const startGame = () => {
-    // 1. BETTING PHASE (5 Seconds)
     gameState.status = 'BETTING';
     gameState.multiplier = 1.00;
     gameState.countdown = 5;
@@ -35,22 +39,21 @@ const startGame = () => {
 
         if (gameState.countdown <= 0) {
             clearInterval(countdownInterval);
-            runGame(); // Start the rocket
+            runGame();
         }
     }, 1000);
 };
 
 const runGame = () => {
-    // 2. RUNNING PHASE (Rocket Flies)
     gameState.status = 'RUNNING';
-    // Crash algorithm: skewed random to crash early often, but sometimes fly high
+    // Crash algorithm
     gameState.crashPoint = Math.max(1.00, (0.99 / (1 - Math.random())));
 
     console.log(`🚀 Launching! Target: ${gameState.crashPoint.toFixed(2)}x`);
     io.emit('game_state_update', gameState);
 
     let flyInterval = setInterval(() => {
-        gameState.multiplier += gameState.multiplier * 0.08; // Speed of rocket
+        gameState.multiplier += gameState.multiplier * 0.08;
 
         if (gameState.multiplier >= gameState.crashPoint) {
             clearInterval(flyInterval);
@@ -62,31 +65,22 @@ const runGame = () => {
 };
 
 const crashGame = () => {
-    // 3. CRASH PHASE (Explosion)
     gameState.status = 'CRASHED';
     io.emit('crash', gameState.multiplier);
-    console.log(`💥 Crashed at ${gameState.multiplier.toFixed(2)}x`);
-
-    // Wait 3 seconds then go back to betting
-    setTimeout(() => {
-        startGame();
-    }, 3000);
+    setTimeout(() => startGame(), 3000);
 };
 
-// Start the loop
 startGame();
 
-// --- SOCKET.IO (Realtime Game) ---
+// --- SOCKET.IO ---
 io.on('connection', (socket) => {
-    socket.emit('game_state_update', gameState); // Send current state to new user
+    socket.emit('game_state_update', gameState);
 
     socket.on('place_bet', async({ userId, amount }) => {
-        if (gameState.status !== 'BETTING') return; // Can only bet during countdown
-
+        if (gameState.status !== 'BETTING') return;
         const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
         if (!user || user.balance < amount) return;
 
-        // Deduct Balance immediately
         await supabase.from('users').update({ balance: user.balance - amount }).eq('id', userId);
         socket.emit('bet_accepted', { amount });
     });
@@ -94,40 +88,85 @@ io.on('connection', (socket) => {
     socket.on('cash_out', async({ userId, amount, multiplier }) => {
         if (gameState.status !== 'RUNNING') return;
         const profit = Math.floor(amount * multiplier);
-
-        // Add Winnings (RPC function recommended, but direct update for MVP is fine)
         const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
         await supabase.from('users').update({ balance: user.balance + profit }).eq('id', userId);
-
         socket.emit('cash_out_success', { profit });
     });
 });
 
-// --- TELEGRAM PAYMENTS (Stars) ---
-// 1. Trigger Invoice
-bot.command('buy', (ctx) => sendInvoice(ctx));
-// Also allow triggering via web app data if needed, but command is easiest for testing
-function sendInvoice(ctx) {
+// --- SISTEM DE RETRAGERE (NOU) ---
+bot.command('withdraw', async(ctx) => {
+    const parts = ctx.message.text.split(' ');
+    // Format: /withdraw 1000 ADRESA_TON
+
+    if (parts.length < 3) {
+        return ctx.reply("❌ Format gresit!\nScrie: /withdraw <SUMA> <ADRESA_TON>\nExemplu: /withdraw 1000 UQDeRtg...");
+    }
+
+    const amount = parseInt(parts[1]);
+    const address = parts[2];
+    const userId = ctx.from.id;
+    const username = ctx.from.username || 'Anonim';
+
+    if (isNaN(amount) || amount < 100) { // Minim 100 cipuri
+        return ctx.reply("❌ Suma minima de retragere este 100 cipuri.");
+    }
+
+    // 1. Verificam Balanta
+    const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
+
+    if (!user || user.balance < amount) {
+        return ctx.reply(`❌ Nu ai suficiente cipuri! Ai doar ${user?.balance || 0}.`);
+    }
+
+    // 2. Scadem banii din baza de date
+    const { error } = await supabase.from('users').update({ balance: user.balance - amount }).eq('id', userId);
+
+    if (error) {
+        return ctx.reply("❌ Eroare tehnica. Incearca mai tarziu.");
+    }
+
+    // 3. Trimitem alerta catre TINE (Admin)
+    const alertMessage = `
+🚨 <b>CERERE DE RETRAGERE NOUA!</b> 🚨
+
+👤 <b>User:</b> @${username} (ID: <code>${userId}</code>)
+💰 <b>Suma:</b> ${amount} Cipuri
+🏦 <b>Adresa TON:</b> <code>${address}</code>
+
+⚠️ <i>Verifica daca a jucat corect si trimite-i banii manual din Wallet!</i>
+`;
+
+    try {
+        // Aici botul iti scrie TIE privat
+        await bot.telegram.sendMessage(ADMIN_ID, alertMessage, { parse_mode: 'HTML' });
+        ctx.reply("✅ Cererea a fost trimisa cu succes!\n⏳ Administratorul va procesa plata in curand.");
+    } catch (err) {
+        console.log("Eroare la trimiterea mesajului catre admin:", err);
+        ctx.reply("✅ Cererea inregistrata (Adminul va verifica manual).");
+    }
+});
+
+// --- TELEGRAM STARS (Plati Oficiale) ---
+bot.command('buy', (ctx) => {
     return ctx.replyWithInvoice({
         title: '1,000 Moon Chips',
         description: 'Fuel for your rocket 🚀',
         payload: 'packet_1000',
-        provider_token: "", // EMPTY for Telegram Stars
-        currency: 'XTR', // The code for Stars
-        prices: [{ label: '1,000 Chips', amount: 50 }], // 50 Stars ($1.00 approx)
+        provider_token: "", // GOL pentru Stars
+        currency: 'XTR', // Moneda Stars
+        prices: [{ label: '1,000 Chips', amount: 50 }], // 50 Stars
     });
-}
+});
 
-// 2. Pre-Checkout (Must approve instantly)
 bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
 
-// 3. Successful Payment (Give Chips)
 bot.on('successful_payment', async(ctx) => {
     const userId = ctx.from.id;
     const username = ctx.from.username || 'Anon';
-    const amountPaid = ctx.message.successful_payment.total_amount; // 50 Stars
+    const amountPaid = ctx.message.successful_payment.total_amount;
 
-    // Logic: 50 Stars = 1000 Chips
+    // 50 Stars = 1000 Chips
     const chipsToAdd = (amountPaid === 50) ? 1000 : 100;
 
     const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
@@ -139,7 +178,7 @@ bot.on('successful_payment', async(ctx) => {
         balance: currentBalance + chipsToAdd
     });
 
-    ctx.reply(`PAYMENT RECEIVED! 🌟\nAdded ${chipsToAdd} Chips to your balance.`);
+    ctx.reply(`PLATA REUSITA! 🌟\nAm adaugat ${chipsToAdd} Cipuri in contul tau.`);
 });
 
 bot.launch();
