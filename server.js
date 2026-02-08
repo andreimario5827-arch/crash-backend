@@ -112,8 +112,8 @@ function sendInvoice(ctx) {
         title: '1,000 Moon Chips',
         description: 'Fuel for your rocket 🚀',
         payload: 'packet_1000',
-        provider_token: "", // EMPTY for Telegram Stars
-        currency: 'XTR', // The code for Stars
+        provider_token: "6395449203:TEST:8b300803a02143a7edff 2026-02-08 07:50", // EMPTY for Telegram Stars
+        currency: 'USD', // The code for Stars
         prices: [{ label: '1,000 Chips', amount: 50 }], // 50 Stars ($1.00 approx)
     });
 }
