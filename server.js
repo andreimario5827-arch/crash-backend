@@ -177,11 +177,18 @@ io.on('connection', (socket) => {
 
     // --- COD NOU: Trimite balanta cand o cere frontend-ul ---
     socket.on('request_balance', async(userId) => {
-        const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
+        console.log(`📡 Frontend a cerut balanta pentru ID: ${userId}`);
+
+        const { data: user, error } = await supabase.from('users').select('balance').eq('id', userId).single();
+
+        if (error) console.log("❌ Eroare cautare user:", error.message);
+
         if (user) {
+            console.log(`✅ User gasit! Trimitem balanta: ${user.balance}`);
             socket.emit('balance_update', user.balance);
         } else {
-            socket.emit('balance_update', 0); // Daca e user nou, are 0
+            console.log(`⚠️ User negasit. Trimitem 0.`);
+            socket.emit('balance_update', 0);
         }
     });
     // ---------------------------------------------------------
