@@ -5,37 +5,134 @@ const { Server } = require('socket.io');
 const { Telegraf } = require('telegraf');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
+const crypto = require('crypto');
 
-// --- CONFIGURARE ADMIN ---
-// ⚠️ INLOCUIESTE '00000000' CU ID-UL TAU DE TELEGRAM (de la @userinfobot)
-const ADMIN_ID = 5418546828;
-// -------------------------
+// =============================================================================
+// CONFIG
+// =============================================================================
+const ADMIN_ID = 5418546828; // Your Telegram ID
 
 const app = express();
 app.use(cors());
+app.use(express.json());
+
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } });
+const io = new Server(server, { cors: { origin: '*' } });
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// Game State
+// =============================================================================
+// HELPERS
+// =============================================================================
+
+/**
+ * Normalise Telegram user IDs to a JavaScript number to match your Supabase int8 column.
+ * Passing a string to .eq() against an int8 column silently returns zero rows —
+ * the #1 reason chips were never delivered after payment.
+ */
+const toUserId = (id) => Number(id);
+
+/**
+ * Fetch a user's current balance. Returns 0 for brand-new users (no row yet).
+ * Throws on real DB errors.
+ */
+const getBalance = async(userId) => {
+    const { data, error } = await supabase
+        .from('users')
+        .select('balance')
+        .eq('id', toUserId(userId))
+        .single();
+
+    // PGRST116 = "no rows returned" — totally normal for a new user
+    if (error && error.code !== 'PGRST116') throw error;
+    return data ? data.balance : 0;
+};
+
+/**
+ * Set a user's balance (upsert — creates the row if it doesn't exist yet).
+ * Always uses onConflict:'id' so Supabase knows to UPDATE, not INSERT a duplicate.
+ */
+const setBalance = async(userId, newBalance, username = 'Anonim') => {
+    const { error } = await supabase
+        .from('users')
+        .upsert({ id: toUserId(userId), username, balance: newBalance }, { onConflict: 'id' });
+    if (error) throw error;
+};
+
+/**
+ * Silently send a message to the admin. Never throws — used inside catch blocks
+ * where we can't afford another failure.
+ */
+const alertAdmin = async(message) => {
+    try {
+        await bot.telegram.sendMessage(ADMIN_ID, message, { parse_mode: 'HTML' });
+    } catch (err) {
+        console.error('Could not reach admin:', err.message);
+    }
+};
+
+// =============================================================================
+// AUTHENTICATION
+// =============================================================================
+
+// In-memory token store: token -> { userId, username }
+// Fine for a single server. For multi-server / restarts, move to Redis or Supabase.
+const authTokens = new Map();
+
+// Called by your Telegram Mini App right after the user opens it.
+// The front-end passes the Telegram userId + username, gets back a session token,
+// then sends that token on every socket event.
+app.post('/auth', (req, res) => {
+    const { userId, username } = req.body;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+
+    const token = crypto.randomBytes(32).toString('hex');
+    authTokens.set(token, {
+        userId: toUserId(userId),
+        username: username || 'Anonim',
+    });
+
+    // Auto-expire after 24 hours
+    setTimeout(() => authTokens.delete(token), 24 * 60 * 60 * 1000);
+
+    res.json({ token });
+});
+
+// =============================================================================
+// GAME STATE
+// =============================================================================
+
 let gameState = {
     status: 'BETTING',
     multiplier: 1.00,
-    crashPoint: 0,
-    countdown: 5
+    crashPoint: 0, // NEVER sent to clients
+    countdown: 5,
 };
 
-// The Game Loop
+// Which users have already cashed out in the current round
+const cashedOutThisRound = new Set();
+
+// Only these fields go to the client — crashPoint stays server-side
+const safeState = () => ({
+    status: gameState.status,
+    multiplier: gameState.multiplier,
+    countdown: gameState.countdown,
+});
+
+// =============================================================================
+// GAME LOOP
+// =============================================================================
+
 const startGame = () => {
     gameState.status = 'BETTING';
     gameState.multiplier = 1.00;
     gameState.countdown = 5;
+    cashedOutThisRound.clear();
 
-    let countdownInterval = setInterval(() => {
+    const countdownInterval = setInterval(() => {
         gameState.countdown--;
-        io.emit('game_state_update', gameState);
+        io.emit('game_state_update', safeState());
 
         if (gameState.countdown <= 0) {
             clearInterval(countdownInterval);
@@ -46,13 +143,12 @@ const startGame = () => {
 
 const runGame = () => {
     gameState.status = 'RUNNING';
-    // Crash algorithm
-    gameState.crashPoint = Math.max(1.00, (0.99 / (1 - Math.random())));
+    gameState.crashPoint = Math.max(1.00, 0.99 / (1 - Math.random()));
 
     console.log(`🚀 Launching! Target: ${gameState.crashPoint.toFixed(2)}x`);
-    io.emit('game_state_update', gameState);
+    io.emit('game_state_update', safeState());
 
-    let flyInterval = setInterval(() => {
+    const flyInterval = setInterval(() => {
         gameState.multiplier += gameState.multiplier * 0.08;
 
         if (gameState.multiplier >= gameState.crashPoint) {
@@ -67,171 +163,254 @@ const runGame = () => {
 const crashGame = () => {
     gameState.status = 'CRASHED';
     io.emit('crash', gameState.multiplier);
-    setTimeout(() => startGame(), 3000);
+    setTimeout(startGame, 3000);
 };
 
 startGame();
 
-// --- SOCKET.IO ---
+// =============================================================================
+// SOCKET.IO
+// =============================================================================
+
 io.on('connection', (socket) => {
-    socket.emit('game_state_update', gameState);
+    socket.emit('game_state_update', safeState());
 
-    socket.on('place_bet', async({ userId, amount }) => {
-        if (gameState.status !== 'BETTING') return;
+    // --- COD NOU: Trimite balanta cand o cere frontend-ul ---
+    socket.on('request_balance', async(userId) => {
         const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
-        if (!user || user.balance < amount) return;
+        if (user) {
+            socket.emit('balance_update', user.balance);
+        } else {
+            socket.emit('balance_update', 0); // Daca e user nou, are 0
+        }
+    });
+    // ---------------------------------------------------------
 
-        await supabase.from('users').update({ balance: user.balance - amount }).eq('id', userId);
-        socket.emit('bet_accepted', { amount });
+    // --- AUTHENTICATE ---
+    // Front-end must call this first with the token from POST /auth
+    socket.on('authenticate', ({ token }) => {
+        const session = authTokens.get(token);
+        if (!session) {
+            socket.emit('auth_error', { message: 'Invalid or expired token. Please re-login.' });
+            return;
+        }
+        socket.userId = session.userId;
+        socket.username = session.username;
+        socket.emit('authenticated', { userId: socket.userId });
     });
 
-    socket.on('cash_out', async({ userId, amount, multiplier }) => {
-        if (gameState.status !== 'RUNNING') return;
+    // --- PLACE BET ---
+    socket.on('place_bet', async({ amount }) => {
+        if (!socket.userId) {
+            socket.emit('error', { message: 'Not authenticated.' });
+            return;
+        }
+        if (gameState.status !== 'BETTING') {
+            socket.emit('error', { message: 'Betting is closed.' });
+            return;
+        }
+        if (!amount || !Number.isInteger(amount) || amount <= 0) {
+            socket.emit('error', { message: 'Invalid bet amount. Must be a positive whole number.' });
+            return;
+        }
+
+        try {
+            const balance = await getBalance(socket.userId);
+
+            if (balance < amount) {
+                socket.emit('error', { message: `Insufficient balance. You have ${balance} chips.` });
+                return;
+            }
+
+            await setBalance(socket.userId, balance - amount, socket.username);
+            socket.emit('bet_accepted', { amount, newBalance: balance - amount });
+        } catch (err) {
+            console.error('place_bet error:', err);
+            socket.emit('error', { message: 'Server error placing bet. Please try again.' });
+        }
+    });
+
+    // --- CASH OUT ---
+    socket.on('cash_out', async({ amount }) => {
+        if (!socket.userId) {
+            socket.emit('error', { message: 'Not authenticated.' });
+            return;
+        }
+        if (gameState.status !== 'RUNNING') {
+            socket.emit('error', { message: 'Game is not running.' });
+            return;
+        }
+        // Guard against double cash-out — reserve BEFORE any async work
+        if (cashedOutThisRound.has(socket.userId)) {
+            socket.emit('error', { message: 'Already cashed out this round.' });
+            return;
+        }
+        cashedOutThisRound.add(socket.userId);
+
+        // Use SERVER-SIDE multiplier — never trust a value sent by the client
+        const multiplier = gameState.multiplier;
         const profit = Math.floor(amount * multiplier);
-        const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
-        await supabase.from('users').update({ balance: user.balance + profit }).eq('id', userId);
-        socket.emit('cash_out_success', { profit });
+
+        try {
+            const balance = await getBalance(socket.userId);
+            await setBalance(socket.userId, balance + profit, socket.username);
+            socket.emit('cash_out_success', { profit, multiplier, newBalance: balance + profit });
+        } catch (err) {
+            console.error('cash_out error:', err);
+            cashedOutThisRound.delete(socket.userId); // Roll back so user can retry
+            socket.emit('error', { message: 'Server error cashing out. Please try again.' });
+        }
     });
 });
 
-// --- SISTEM DE RETRAGERE (NOU) ---
+// =============================================================================
+// TELEGRAM BOT — WITHDRAW
+// =============================================================================
+
 bot.command('withdraw', async(ctx) => {
     const parts = ctx.message.text.split(' ');
-    // Format: /withdraw 1000 ADRESA_TON
 
     if (parts.length < 3) {
-        return ctx.reply("❌ Format gresit!\nScrie: /withdraw <SUMA> <ADRESA_TON>\nExemplu: /withdraw 1000 UQDeRtg...");
+        return ctx.reply(
+            '❌ Format gresit!\nScrie: /withdraw <SUMA> <ADRESA_TON>\nExemplu: /withdraw 1000 UQDeRtg...'
+        );
     }
 
-    const amount = parseInt(parts[1]);
+    const amount = parseInt(parts[1], 10);
     const address = parts[2];
-    const userId = ctx.from.id;
+    const userId = toUserId(ctx.from.id); // always string
     const username = ctx.from.username || 'Anonim';
 
-    if (isNaN(amount) || amount < 100) { // Minim 100 cipuri
-        return ctx.reply("❌ Suma minima de retragere este 100 cipuri.");
+    if (isNaN(amount) || amount < 100) {
+        return ctx.reply('❌ Suma minima de retragere este 100 cipuri.');
     }
-
-    // 1. Verificam Balanta
-    const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
-
-    if (!user || user.balance < amount) {
-        return ctx.reply(`❌ Nu ai suficiente cipuri! Ai doar ${user?.balance || 0}.`);
-    }
-
-    // 2. Scadem banii din baza de date
-    const { error } = await supabase.from('users').update({ balance: user.balance - amount }).eq('id', userId);
-
-    if (error) {
-        return ctx.reply("❌ Eroare tehnica. Incearca mai tarziu.");
-    }
-
-    // 3. Trimitem alerta catre TINE (Admin)
-    const alertMessage = `
-🚨 <b>CERERE DE RETRAGERE NOUA!</b> 🚨
-
-👤 <b>User:</b> @${username} (ID: <code>${userId}</code>)
-💰 <b>Suma:</b> ${amount} Cipuri
-🏦 <b>Adresa TON:</b> <code>${address}</code>
-
-⚠️ <i>Verifica daca a jucat corect si trimite-i banii manual din Wallet!</i>
-`;
 
     try {
-        // Aici botul iti scrie TIE privat
+        const balance = await getBalance(userId);
+
+        if (balance < amount) {
+            return ctx.reply(`❌ Nu ai suficiente cipuri! Ai doar ${balance}.`);
+        }
+
+        const alertMessage = [
+            '🚨 <b>CERERE DE RETRAGERE NOUA!</b> 🚨',
+            '',
+            `👤 <b>User:</b> @${username} (ID: <code>${userId}</code>)`,
+            `💰 <b>Suma:</b> ${amount} Cipuri`,
+            `🏦 <b>Adresa TON:</b> <code>${address}</code>`,
+            '',
+            '⚠️ <i>Verifica daca a jucat corect si trimite-i banii manual din Wallet!</i>',
+        ].join('\n');
+
+        // Send admin alert FIRST — only deduct if alert succeeds.
+        // If the alert fails, user keeps their chips and can try again.
         await bot.telegram.sendMessage(ADMIN_ID, alertMessage, { parse_mode: 'HTML' });
-        ctx.reply("✅ Cererea a fost trimisa cu succes!\n⏳ Administratorul va procesa plata in curand.");
+
+        // Alert succeeded — safe to deduct now
+        await setBalance(userId, balance - amount, username);
+
+        return ctx.reply('✅ Cererea a fost trimisa cu succes!\n⏳ Administratorul va procesa plata in curand.');
+
     } catch (err) {
-        console.log("Eroare la trimiterea mesajului catre admin:", err);
-        ctx.reply("✅ Cererea inregistrata (Adminul va verifica manual).");
+        console.error('withdraw error:', err);
+        return ctx.reply('❌ A aparut o eroare. Incearca mai tarziu. Cipurile tale sunt in siguranta.');
     }
 });
 
-// --- TELEGRAM STARS (Plati Oficiale) ---
+// =============================================================================
+// TELEGRAM BOT — BUY (Telegram Stars)
+// =============================================================================
+
 bot.command('buy', (ctx) => {
     return ctx.replyWithInvoice({
         title: '1,000 Moon Chips',
         description: 'Fuel for your rocket 🚀',
         payload: 'packet_1000',
-        provider_token: "", // GOL pentru Stars
-        currency: 'XTR', // Moneda Stars
+        provider_token: '', // Empty string = Telegram Stars
+        currency: 'XTR',
         prices: [{ label: '1,000 Chips', amount: 50 }], // 50 Stars
     });
 });
 
-// --- CONFIRMARE PLATA (Pre-Checkout) ---
-// Aceasta linie este OBLIGATORIE ca plata sa nu fie anulata de Telegram
+// Required by Telegram — must answer true or the payment is cancelled
 bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
 
-// --- PROCESARE PLATA (Dupa ce au dat banii) ---
+// =============================================================================
+// TELEGRAM BOT — SUCCESSFUL PAYMENT (chip delivery)
+// =============================================================================
+
 bot.on('successful_payment', async(ctx) => {
-    // 1. LOG DEBUT - Vedem ce primim de la Telegram
-    console.log("💰 PLATA PRIMITA! Detalii:", ctx.message.successful_payment);
-
-    const userId = ctx.from.id;
-    const username = ctx.from.username || 'Anonim';
-    const amountPaid = ctx.message.successful_payment.total_amount;
-    const currency = ctx.message.successful_payment.currency;
-
-    console.log(`👤 Procesam pentru User ID: ${userId} (${username}) | Suma: ${amountPaid} ${currency}`);
-
-    // 2. LOGICA SIMPLIFICATA - Daca a platit, ii dam cipurile!
-    // Nu mai verificam strict daca e 50 sau 5000, ca sa evitam erori de unitati.
-    const chipsToAdd = 1000;
-
     try {
-        // 3. CITIM BALANTA ACTUALA
-        const { data: user, error: fetchError } = await supabase
-            .from('users')
-            .select('balance')
-            .eq('id', userId)
-            .single();
+        console.log('💰 PLATA PRIMITA:', ctx.message.successful_payment);
 
-        if (fetchError && fetchError.code !== 'PGRST116') { // Ignoram eroarea "User not found" (e normal la primul joc)
-            console.error("❌ Eroare la citirea din baza de date:", fetchError);
-            return ctx.reply("Am primit plata, dar avem o eroare la baza de date. Contacteaza adminul!");
-        }
+        // toUserId() ensures the string type matches the Supabase 'id' column.
+        // Without this, .eq() silently finds zero rows and chips are never added.
+        const userId = toUserId(ctx.from.id);
+        const username = ctx.from.username || 'Anonim';
+        const { total_amount, currency } = ctx.message.successful_payment;
 
-        const currentBalance = user ? user.balance : 0;
+        console.log(`👤 User: ${userId} (${username}) | Paid: ${total_amount} ${currency}`);
+
+        const chipsToAdd = 1000;
+
+        // Read current balance (returns 0 if user is new — no row in DB yet)
+        const currentBalance = await getBalance(userId);
         const newBalance = currentBalance + chipsToAdd;
 
-        console.log(`🔄 Actualizam balanta: ${currentBalance} -> ${newBalance}`);
+        console.log(`🔄 Balance: ${currentBalance} → ${newBalance}`);
 
-        // 4. SALVAM NOUA BALANTA
-        const { error: upsertError } = await supabase
-            .from('users')
-            .upsert({
-                id: userId,
-                username: username,
-                balance: newBalance
-            });
+        // Write new balance.
+        // setBalance uses upsert + onConflict:'id' so it always updates correctly.
+        await setBalance(userId, newBalance, username);
 
-        if (upsertError) {
-            console.error("❌ Eroare la scrierea in baza de date:", upsertError);
-            return ctx.reply("Eroare critica la salvare. Trimite un screenshot adminului.");
-        }
+        console.log(`✅ SUCCESS: ${chipsToAdd} chips added for ${userId}. New balance: ${newBalance}`);
 
-        console.log("✅ SUCCES! Cipurile au fost adaugate.");
-
-        // 5. CONFIRMARE CATRE UTILIZATOR
-        await ctx.reply(`✅ PLATA REUSITA! 🌟\n\nAi primit ${chipsToAdd} Cipuri.\nBalanța ta nouă: ${newBalance} 🪙`);
+        await ctx.reply(
+            `✅ PLATA REUSITA! 🌟\n\n` +
+            `Ai primit ${chipsToAdd} Cipuri 🪙\n` +
+            `Balanța ta nouă: ${newBalance} 🪙\n\n` +
+            `Apasă /play ca să începi!`
+        );
 
     } catch (err) {
-        console.error("❌ EROARE NEASTEPTATA:", err);
+        // Top-level catch — always notify both the admin and the user
+        console.error('❌ EROARE in successful_payment:', err);
+
+        await alertAdmin(
+            `🚨 <b>EROARE LA PROCESAREA PLATII!</b>\n` +
+            `User: @${ctx.from?.username || '?'} (ID: <code>${ctx.from?.id}</code>)\n` +
+            `Chips de adaugat manual: 1000\n` +
+            `Eroare: ${err.message}`
+        );
+
+        try {
+            await ctx.reply(
+                '⚠️ Plata ta a fost primita de Telegram, dar a aparut o eroare la salvare.\n' +
+                'Adminul a fost notificat si va adauga cipurile manual. Ne cerem scuze!'
+            );
+        } catch (_) {
+            // ctx.reply itself failed — nothing more we can do
+        }
     }
 });
-// --- COMANDA DE START JOC ---
+
+// =============================================================================
+// TELEGRAM BOT — PLAY
+// =============================================================================
+
 bot.command('play', (ctx) => {
     return ctx.reply('Ești gata de lansare? 🚀\n\nJoacă acum și câștigă cipuri!', {
         reply_markup: {
             inline_keyboard: [
-                [
-                    // Folosim "url" pentru link-ul t.me
-                    { text: "🎮 PLAY NOW", url: "https://t.me/MoversCrash_bot/play" }
-                ]
-            ]
-        }
+                [{ text: '🎮 PLAY NOW', url: 'https://t.me/MoversCrash_bot/play' }],
+            ],
+        },
     });
 });
+
+// =============================================================================
+// START
+// =============================================================================
+
 bot.launch();
-server.listen(3000, () => console.log('Server running on 3000'));
+server.listen(3000, () => console.log('🟢 Server running on port 3000'));
