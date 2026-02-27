@@ -207,34 +207,36 @@ io.on('connection', (socket) => {
     });
 
     // --- PLACE BET ---
-    socket.on('place_bet', async({ amount }) => {
-        if (!socket.userId) {
-            socket.emit('error', { message: 'Not authenticated.' });
-            return;
-        }
+    socket.on('place_bet', async({ userId, amount }) => {
+        console.log(`🎰 Pariu cerut: ID ${userId} | Suma: ${amount} | Status Joc: ${gameState.status}`);
+
         if (gameState.status !== 'BETTING') {
-            socket.emit('error', { message: 'Betting is closed.' });
-            return;
-        }
-        if (!amount || !Number.isInteger(amount) || amount <= 0) {
-            socket.emit('error', { message: 'Invalid bet amount. Must be a positive whole number.' });
+            console.log("❌ Pariu respins: Jocul nu e in faza de pariere.");
             return;
         }
 
-        try {
-            const balance = await getBalance(socket.userId);
+        const { data: user, error: fetchError } = await supabase.from('users').select('balance').eq('id', userId).single();
 
-            if (balance < amount) {
-                socket.emit('error', { message: `Insufficient balance. You have ${balance} chips.` });
-                return;
-            }
-
-            await setBalance(socket.userId, balance - amount, socket.username);
-            socket.emit('bet_accepted', { amount, newBalance: balance - amount });
-        } catch (err) {
-            console.error('place_bet error:', err);
-            socket.emit('error', { message: 'Server error placing bet. Please try again.' });
+        if (fetchError || !user) {
+            console.log("❌ Pariu respins: Userul nu a fost gasit in baza de date.", fetchError);
+            return;
         }
+
+        if (user.balance < amount) {
+            console.log(`❌ Pariu respins: Balanta insuficienta (${user.balance} < ${amount}).`);
+            return;
+        }
+
+        // Scadem banii din baza de date
+        const { error: updateError } = await supabase.from('users').update({ balance: user.balance - amount }).eq('id', userId);
+
+        if (updateError) {
+            console.log("❌ Eroare la actualizarea bazei de date:", updateError);
+            return;
+        }
+
+        console.log(`✅ Pariu ACCEPTAT pentru ${userId}!`);
+        socket.emit('bet_accepted', { amount });
     });
 
     // --- CASH OUT ---
