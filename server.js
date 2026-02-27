@@ -240,35 +240,35 @@ io.on('connection', (socket) => {
     });
 
     // --- CASH OUT ---
-    socket.on('cash_out', async({ amount }) => {
-        if (!socket.userId) {
-            socket.emit('error', { message: 'Not authenticated.' });
-            return;
-        }
-        if (gameState.status !== 'RUNNING') {
-            socket.emit('error', { message: 'Game is not running.' });
-            return;
-        }
-        // Guard against double cash-out — reserve BEFORE any async work
-        if (cashedOutThisRound.has(socket.userId)) {
-            socket.emit('error', { message: 'Already cashed out this round.' });
-            return;
-        }
-        cashedOutThisRound.add(socket.userId);
+    socket.on('cash_out', async({ userId, amount, multiplier }) => {
+        console.log(`💸 Cash Out cerut: ID ${userId} | Pariu: ${amount} | Multiplicator: ${multiplier}`);
 
-        // Use SERVER-SIDE multiplier — never trust a value sent by the client
-        const multiplier = gameState.multiplier;
+        if (gameState.status !== 'RUNNING') {
+            console.log("❌ Cash Out respins: Racheta a explodat deja sau jocul nu ruleaza.");
+            return;
+        }
+
+        // Calculam profitul (ex: 10 * 2.50 = 25)
         const profit = Math.floor(amount * multiplier);
 
-        try {
-            const balance = await getBalance(socket.userId);
-            await setBalance(socket.userId, balance + profit, socket.username);
-            socket.emit('cash_out_success', { profit, multiplier, newBalance: balance + profit });
-        } catch (err) {
-            console.error('cash_out error:', err);
-            cashedOutThisRound.delete(socket.userId); // Roll back so user can retry
-            socket.emit('error', { message: 'Server error cashing out. Please try again.' });
+        const { data: user, error: fetchError } = await supabase.from('users').select('balance').eq('id', userId).single();
+
+        if (fetchError || !user) {
+            console.log("❌ Cash Out respins: Userul nu a fost gasit in baza de date.", fetchError);
+            return;
         }
+
+        // Adaugam profitul la balanta utilizatorului
+        const { error: updateError } = await supabase.from('users').update({ balance: user.balance + profit }).eq('id', userId);
+
+        if (updateError) {
+            console.log("❌ Eroare Cash Out la salvarea in baza de date:", updateError);
+            return;
+        }
+
+        console.log(`✅ Cash Out REUSIT pentru ${userId}! A castigat +${profit} cipuri.`);
+        // Trimitem confirmarea catre telefon ca sa ascunda butonul verde
+        socket.emit('cash_out_success', { profit });
     });
 });
 
