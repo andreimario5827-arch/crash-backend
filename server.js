@@ -276,53 +276,51 @@ io.on('connection', (socket) => {
 // TELEGRAM BOT — WITHDRAW
 // =============================================================================
 
+// --- COMANDA WITHDRAW (Retragere Manuala) ---
 bot.command('withdraw', async(ctx) => {
     const parts = ctx.message.text.split(' ');
 
     if (parts.length < 3) {
-        return ctx.reply(
-            '❌ Format gresit!\nScrie: /withdraw <SUMA> <ADRESA_TON>\nExemplu: /withdraw 1000 UQDeRtg...'
-        );
+        return ctx.reply("❌ Invalid format!\nType: /withdraw <AMOUNT> <TON_ADDRESS>\nExample: /withdraw 1000 UQDeRtg...");
     }
 
-    const amount = parseInt(parts[1], 10);
+    const amount = parseInt(parts[1]);
     const address = parts[2];
-    const userId = toUserId(ctx.from.id); // always string
-    const username = ctx.from.username || 'Anonim';
+    const userId = ctx.from.id;
+    const username = ctx.from.username || 'Anonymous';
 
     if (isNaN(amount) || amount < 100) {
-        return ctx.reply('❌ Suma minima de retragere este 100 cipuri.');
+        return ctx.reply("❌ The minimum withdrawal amount is 100 chips.");
     }
 
+    const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
+
+    if (!user || user.balance < amount) {
+        return ctx.reply(`❌ Not enough chips! You only have ${user?.balance || 0}.`);
+    }
+
+    const { error } = await supabase.from('users').update({ balance: user.balance - amount }).eq('id', userId);
+
+    if (error) {
+        return ctx.reply("❌ Technical error. Please try again later.");
+    }
+
+    const alertMessage = `
+🚨 <b>NEW WITHDRAWAL REQUEST!</b> 🚨
+
+👤 <b>User:</b> @${username} (ID: <code>${userId}</code>)
+💰 <b>Amount:</b> ${amount} Chips
+🏦 <b>TON Address:</b> <code>${address}</code>
+
+⚠️ <i>Verify if they played fairly and send the funds manually from your Wallet!</i>
+`;
+
     try {
-        const balance = await getBalance(userId);
-
-        if (balance < amount) {
-            return ctx.reply(`❌ Nu ai suficiente cipuri! Ai doar ${balance}.`);
-        }
-
-        const alertMessage = [
-            '🚨 <b>CERERE DE RETRAGERE NOUA!</b> 🚨',
-            '',
-            `👤 <b>User:</b> @${username} (ID: <code>${userId}</code>)`,
-            `💰 <b>Suma:</b> ${amount} Cipuri`,
-            `🏦 <b>Adresa TON:</b> <code>${address}</code>`,
-            '',
-            '⚠️ <i>Verifica daca a jucat corect si trimite-i banii manual din Wallet!</i>',
-        ].join('\n');
-
-        // Send admin alert FIRST — only deduct if alert succeeds.
-        // If the alert fails, user keeps their chips and can try again.
         await bot.telegram.sendMessage(ADMIN_ID, alertMessage, { parse_mode: 'HTML' });
-
-        // Alert succeeded — safe to deduct now
-        await setBalance(userId, balance - amount, username);
-
-        return ctx.reply('✅ Cererea a fost trimisa cu succes!\n⏳ Administratorul va procesa plata in curand.');
-
+        ctx.reply("✅ Request sent successfully!\n⏳ An administrator will process your payment soon.");
     } catch (err) {
-        console.error('withdraw error:', err);
-        return ctx.reply('❌ A aparut o eroare. Incearca mai tarziu. Cipurile tale sunt in siguranta.');
+        console.log("Error sending admin alert:", err);
+        ctx.reply("✅ Request registered.");
     }
 });
 
@@ -374,12 +372,8 @@ bot.on('successful_payment', async(ctx) => {
 
         console.log(`✅ SUCCESS: ${chipsToAdd} chips added for ${userId}. New balance: ${newBalance}`);
 
-        await ctx.reply(
-            `✅ PLATA REUSITA! 🌟\n\n` +
-            `Ai primit ${chipsToAdd} Cipuri 🪙\n` +
-            `Balanța ta nouă: ${newBalance} 🪙\n\n` +
-            `Apasă /play ca să începi!`
-        );
+        // 5. CONFIRMARE CATRE UTILIZATOR
+        await ctx.reply(`✅ PAYMENT SUCCESSFUL! 🌟\n\nYou received ${chipsToAdd} Chips.\nYour new balance is: ${newBalance} 🪙`);
 
     } catch (err) {
         // Top-level catch — always notify both the admin and the user
@@ -408,7 +402,7 @@ bot.on('successful_payment', async(ctx) => {
 // =============================================================================
 
 bot.command('play', (ctx) => {
-    return ctx.reply('Ești gata de lansare? 🚀\n\nJoacă acum și câștigă cipuri!', {
+    return ctx.reply('Ready for launch? 🚀\n\nPlay now and win chips!', {
         reply_markup: {
             inline_keyboard: [
                 [{ text: '🎮 PLAY NOW', url: 'https://t.me/MoversCrash_bot/play' }],
