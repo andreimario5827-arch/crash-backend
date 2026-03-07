@@ -357,72 +357,78 @@ bot.command('withdraw', async(ctx) => {
 // TELEGRAM BOT — BUY (Telegram Stars)
 // =============================================================================
 
-bot.command('buy', (ctx) => {
-    return ctx.replyWithInvoice({
-        title: '1,000 Moon Chips',
-        description: 'Fuel for your rocket 🚀',
-        payload: 'packet_1000',
-        provider_token: '', // Empty string = Telegram Stars
-        currency: 'XTR',
-        prices: [{ label: '1,000 Chips', amount: 50 }], // 50 Stars
+// --- CHIP STORE (MEGA PACKS) ---
+
+const sendBuyMenu = (ctx) => {
+    return ctx.reply('🛒 Choose a chip package:', {
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: "🪙 5,000 Chips - ⭐️ 50", callback_data: "buy_50" }],
+                [{ text: "🪙 12,000 Chips - ⭐️ 100", callback_data: "buy_100" }],
+                [{ text: "🪙 75,000 Chips - ⭐️ 500", callback_data: "buy_500" }],
+                [{ text: "🪙 200,000 Chips - ⭐️ 1000", callback_data: "buy_1000" }]
+            ]
+        }
+    });
+};
+
+bot.command('buy', sendBuyMenu);
+bot.start((ctx) => {
+    if (ctx.payload === 'buy') return sendBuyMenu(ctx);
+    ctx.reply("Welcome to Movers Crash! 🚀\nType /play to start.");
+});
+
+const packages = {
+    'buy_50': { chips: 5000, stars: 50 },
+    'buy_100': { chips: 12000, stars: 100 },
+    'buy_500': { chips: 75000, stars: 500 },
+    'buy_1000': { chips: 200000, stars: 1000 }
+};
+
+Object.keys(packages).forEach(key => {
+    bot.action(key, (ctx) => {
+        const pkg = packages[key];
+        return ctx.replyWithInvoice({
+            title: `${pkg.chips.toLocaleString()} Moon Chips`,
+            description: `Fuel for your rocket 🚀`,
+            payload: `packet_${pkg.chips}`,
+            provider_token: "", // GOL pentru Stars
+            currency: 'XTR', // Moneda Stars
+            prices: [{ label: `${pkg.chips.toLocaleString()} Chips`, amount: pkg.stars }],
+        }, {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: `Pay ⭐️ ${pkg.stars}`, pay: true }] // FORTEAZA TEXTUL IN ENGLEZA
+                ]
+            }
+        });
     });
 });
 
-// Required by Telegram — must answer true or the payment is cancelled
 bot.on('pre_checkout_query', (ctx) => ctx.answerPreCheckoutQuery(true));
 
-// =============================================================================
-// TELEGRAM BOT — SUCCESSFUL PAYMENT (chip delivery)
-// =============================================================================
-
 bot.on('successful_payment', async(ctx) => {
+    console.log("💰 PAYMENT RECEIVED! Details:", ctx.message.successful_payment);
+
+    const userId = ctx.from.id;
+    const amountPaid = ctx.message.successful_payment.total_amount;
+
+    // Cate cipuri primeste in functie de pachet
+    let chipsToAdd = 0;
+    if (amountPaid === 50) chipsToAdd = 5000;
+    else if (amountPaid === 100) chipsToAdd = 12000;
+    else if (amountPaid === 500) chipsToAdd = 75000;
+    else if (amountPaid === 1000) chipsToAdd = 200000;
+
     try {
-        console.log('💰 PLATA PRIMITA:', ctx.message.successful_payment);
+        const { data: user } = await supabase.from('users').select('balance').eq('id', userId).single();
+        const newBalance = (user ? user.balance : 0) + chipsToAdd;
 
-        // toUserId() ensures the string type matches the Supabase 'id' column.
-        // Without this, .eq() silently finds zero rows and chips are never added.
-        const userId = toUserId(ctx.from.id);
-        const username = ctx.from.username || 'Anonim';
-        const { total_amount, currency } = ctx.message.successful_payment;
+        await supabase.from('users').update({ balance: newBalance }).eq('id', userId);
 
-        console.log(`👤 User: ${userId} (${username}) | Paid: ${total_amount} ${currency}`);
-
-        const chipsToAdd = 1000;
-
-        // Read current balance (returns 0 if user is new — no row in DB yet)
-        const currentBalance = await getBalance(userId);
-        const newBalance = currentBalance + chipsToAdd;
-
-        console.log(`🔄 Balance: ${currentBalance} → ${newBalance}`);
-
-        // Write new balance.
-        // setBalance uses upsert + onConflict:'id' so it always updates correctly.
-        await setBalance(userId, newBalance, username);
-
-        console.log(`✅ SUCCESS: ${chipsToAdd} chips added for ${userId}. New balance: ${newBalance}`);
-
-        // 5. CONFIRMARE CATRE UTILIZATOR
-        await ctx.reply(`✅ PAYMENT SUCCESSFUL! 🌟\n\nYou received ${chipsToAdd} Chips.\nYour new balance is: ${newBalance} 🪙`);
-
+        await ctx.reply(`✅ PAYMENT SUCCESSFUL! 🌟\n\nYou received ${chipsToAdd.toLocaleString()} Chips.\nYour new balance is: ${newBalance.toLocaleString()} 🪙`);
     } catch (err) {
-        // Top-level catch — always notify both the admin and the user
-        console.error('❌ EROARE in successful_payment:', err);
-
-        await alertAdmin(
-            `🚨 <b>EROARE LA PROCESAREA PLATII!</b>\n` +
-            `User: @${ctx.from?.username || '?'} (ID: <code>${ctx.from?.id}</code>)\n` +
-            `Chips de adaugat manual: 1000\n` +
-            `Eroare: ${err.message}`
-        );
-
-        try {
-            await ctx.reply(
-                '⚠️ Plata ta a fost primita de Telegram, dar a aparut o eroare la salvare.\n' +
-                'Adminul a fost notificat si va adauga cipurile manual. Ne cerem scuze!'
-            );
-        } catch (_) {
-            // ctx.reply itself failed — nothing more we can do
-        }
+        console.error("❌ PAYMENT ERROR:", err);
     }
 });
 
