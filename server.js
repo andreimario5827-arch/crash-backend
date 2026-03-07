@@ -124,15 +124,20 @@ const safeState = () => ({
 // GAME LOOP
 // =============================================================================
 
+let currentRoundBets = 0; // Memoreaza cati bani s-au pariat in runda curenta
+
 const startGame = () => {
     gameState.status = 'BETTING';
-    gameState.multiplier = 1.00;
+    gameState.multiplier = 1.00; // MODIFICA IN 0.00 DACA VREI SA INCEAPA DE LA 0
     gameState.countdown = 5;
-    cashedOutThisRound.clear();
+    currentRoundBets = 0; // Resetam pariurile la inceputul rundei
+    // NOTA: pastreaza cashedOutThisRound.clear() daca il aveai in codul tau!
+    if (typeof cashedOutThisRound !== 'undefined') cashedOutThisRound.clear();
 
-    const countdownInterval = setInterval(() => {
+    let countdownInterval = setInterval(() => {
         gameState.countdown--;
-        io.emit('game_state_update', safeState());
+        // Folosim safeState() cum aveai tu in cod
+        io.emit('game_state_update', typeof safeState === 'function' ? safeState() : gameState);
 
         if (gameState.countdown <= 0) {
             clearInterval(countdownInterval);
@@ -143,13 +148,35 @@ const startGame = () => {
 
 const runGame = () => {
     gameState.status = 'RUNNING';
-    gameState.crashPoint = Math.max(1.00, 0.99 / (1 - Math.random()));
 
-    console.log(`🚀 Launching! Target: ${gameState.crashPoint.toFixed(2)}x`);
-    io.emit('game_state_update', safeState());
+    // 1. ALGORITMUL DE BAZA
+    let baseCrash = 0.99 / (1 - Math.random());
 
-    const flyInterval = setInterval(() => {
-        gameState.multiplier += gameState.multiplier * 0.08;
+    // 2. ALGORITMUL INTELIGENT (Invata din pariuri)
+    console.log(`🤖 Pariuri totale in runda asta: ${currentRoundBets} cipuri.`);
+
+    if (currentRoundBets > 5000) {
+        console.log("⚠️ Risc mare pentru Casa! Reducem zborul.");
+        baseCrash = baseCrash * 0.4;
+    } else if (currentRoundBets > 1000) {
+        baseCrash = baseCrash * 0.8;
+    } else if (currentRoundBets < 100) {
+        console.log("🎣 Pariuri mici. Lasam racheta sa zboare sus!");
+        baseCrash = baseCrash * 1.5;
+    }
+
+    // Setam punctul de crash
+    gameState.crashPoint = Math.max(1.00, baseCrash); // PUNE 0.00 IN LOC DE 1.00 DACA VREI SA INCEAPA DE LA 0
+
+    io.emit('game_state_update', typeof safeState === 'function' ? safeState() : gameState);
+
+    let ticks = 0;
+    let flyInterval = setInterval(() => {
+        ticks++;
+
+        // 3. NOUA CURBA DE ZBOR (Lina la inceput, accelerata la final)
+        const speedCurve = 0.002 + (ticks * 0.0005);
+        gameState.multiplier += speedCurve;
 
         if (gameState.multiplier >= gameState.crashPoint) {
             clearInterval(flyInterval);
@@ -234,6 +261,8 @@ io.on('connection', (socket) => {
             console.log("❌ Eroare la actualizarea bazei de date:", updateError);
             return;
         }
+
+        currentRoundBets += amount;
 
         console.log(`✅ Pariu ACCEPTAT pentru ${userId}!`);
         socket.emit('bet_accepted', { amount });
